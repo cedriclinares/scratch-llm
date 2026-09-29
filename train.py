@@ -1,23 +1,29 @@
+import time
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# hyperparameters
-batch_size = 64
-block_size = 256
-max_iters = 5001
-eval_interval = 500
-learning_rate = 3e-4
+# ---------------------------------------------------------------------------
+# Hyperparameters
+# ---------------------------------------------------------------------------
+batch_size = 64          # number of sequences processed per step
+block_size = 256         # max context length (how far back the model looks)
+max_iters = 1500         # total number of training steps
+eval_interval = 500      # how often to evaluate train/val loss
+learning_rate = 3e-4     # AdamW learning rate
 device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-eval_iters = 200
-n_embd = 384
-n_head = 6
-n_layer = 6
-dropout = 0.2
+eval_iters = 200         # number of batches sampled for loss estimation
+n_embd = 128             # dimension of each token embedding (C)
+n_head = 4               # number of parallel attention heads
+n_layer = 6              # number of stacked transformer blocks
+dropout = 0.2            # dropout rate for attention / feed-forward
 # max_seq_len = 501  # must be >= block_size and >= any max_new_tokens + context length
 
 torch.manual_seed(1337)
 
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 with open("tiny-shakespeare.txt", "r") as f:
     text = f.read()
 
@@ -64,6 +70,9 @@ def estimate_loss():
     model.train()
     return out
 
+# ---------------------------------------------------------------------------
+# Transformer building blocks
+# ---------------------------------------------------------------------------
 class Head(nn.Module):
     """One head of self attention"""
 
@@ -195,14 +204,74 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
 
+# ---------------------------------------------------------------------------
+# Diagnostics helpers
+# ---------------------------------------------------------------------------
+def get_grad_norm(model):
+    """Global L2 norm of all gradients - a quick sanity check for exploding/vanishing grads."""
+    total = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            total += p.grad.data.norm(2).item() ** 2
+    return total ** 0.5
+
+def print_attention_map(model, idx, layer_idx=0, head_idx=0, max_T=16):
+    """
+    Visualize the attention weights of a single head in a single block.
+    Rows = the token attending, columns = the tokens it looks at.
+    A diagonal-heavy map means each token mostly attends to itself / nearby tokens.
+    """
+    model.eval()
+    with torch.no_grad():
+        B, T = idx.shape
+        T = min(T, max_T)
+        idx = idx[:, :T]
+        tok_emb = model.token_embedding_table(idx)
+        pos_emb = model.position_embedding_table(torch.arange(T, device=idx.device))
+        x = tok_emb + pos_emb
+        x = model.blocks[layer_idx].ln1(x)
+        head = model.blocks[layer_idx].sa.heads[head_idx]
+        k = head.key(x)
+        q = head.query(x)
+        wei = q @ k.transpose(-2, -1) * k.shape[-1] ** -0.5
+        wei = wei.masked_fill(head.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+    model.train()
+
+    print(f"\n--- Attention map: block {layer_idx}, head {head_idx} "
+          f"(rows attend to columns) ---")
+    tokens = [decode(idx[0, t].item()) for t in range(T)]
+    header = "     " + " ".join(f"{t:>3}" for t in tokens)
+    print(header)
+    for r in range(T):
+        row = " ".join(f"{wei[0, r, c].item():.3f}" for c in range(T))
+        print(f"{tokens[r]:>3} | {row}")
+    print()
+
+# ---------------------------------------------------------------------------
+# Model instantiation
+# ---------------------------------------------------------------------------
 model = BigramLanguageModel()
 print(device)
 m = model.to(device)
 
+# Report the model size so we know what we're training
+n_params = sum(p.numel() for p in m.parameters())
+print(f"Model parameters: {n_params:,} ({n_params/1e6:.2f}M)")
+
 print(decode(m.generate(idx = torch.zeros((1,1), dtype=torch.long, device=device), max_new_tokens=100)[0].tolist()))
 optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
 
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
+print(f"\nStarting training: {max_iters} iters, batch={batch_size}, "
+      f"block_size={block_size}, n_embd={n_embd}, n_head={n_head}, "
+      f"n_layer={n_layer}, lr={learning_rate}, device={device}\n")
+
 for iter in range(max_iters):
+    t0 = time.time()
+
     if iter % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -213,6 +282,14 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
- 
+
+    # Per-step logging: loss, gradient norm, and throughput
+    gnorm = get_grad_norm(m)
+    dt = time.time() - t0
+    print(f"iter {iter:5d} | loss {loss.item():.4f} | grad_norm {gnorm:.4f} | {dt*1000:.0f} ms")
+
 context = torch.zeros((1,1), dtype=torch.long, device=device)
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+
+# Show what the model's attention looks like after training
+print_attention_map(m, context, layer_idx=0, head_idx=0)
